@@ -1,0 +1,30 @@
+name: ECHO weekly lead extract
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run extractor
+        run: python filter_echo.py
+        env:
+          LOOKBACK_DAYS: "10"
+
+      - name: Commit result
+        run: |
+          git config user.name "echo-bot"
+          git config user.email "actions@github.com"
+          git add echo_leads.csv
+          git diff --cached --quiet || git commit -m "ECHO leads $(date -u +%F)"
+          git push
