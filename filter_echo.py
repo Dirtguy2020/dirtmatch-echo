@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-ECHO weekly NPDES construction-stormwater lead extractor for DirtMatch.
+ECHO weekly NPDES dirt-related lead extractor for DirtMatch.
 
 Downloads EPA's weekly bulk NPDES file (~330 MB zip), filters general-permit
-coverages (GPC) under construction master permits, joins facility addresses,
-and writes a small CSV of fresh leads (operator name + site address).
+coverages (GPC) under dirt-related master permits -- construction stormwater,
+mining/sand/gravel/quarry, and dredge/dewatering/excavation -- joins facility
+addresses, and writes a small CSV of fresh leads (operator name + site address).
+All states included; cross-source/double-contact dedup is handled in n8n.
 
 Output columns match the n8n canonical lead schema.
 Run weekly (GitHub Action provided in .github/workflows/echo-weekly.yml).
@@ -23,10 +25,22 @@ ZIP_URL = "https://echo.epa.gov/files/echodownloads/npdes_downloads.zip"
 ZIP_PATH = "npdes_downloads.zip"
 OUT_PATH = "echo_leads.csv"
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "10"))  # weekly run + overlap
-# States already covered by direct feeds in n8n (skip to avoid duplicates):
-SKIP_STATES = {"TX", "UT", "IL", "SD", "MA", "NH", "NM", "DC", "PR", "VI"}
+# No states skipped: n8n dedups cross-source at the permit and email level,
+# so overlap with the direct TX/NeT feeds cannot double-contact anyone.
+SKIP_STATES = set()
 
 CGP_ID_RE = re.compile(r"^[A-Z]{2}R1[05]", re.I)  # e.g. FLR10..., SCR10..., COR40 handled via master list
+
+# Dirt-related master-permit categories (first match wins). Each coverage under
+# a matching master becomes a lead labeled with that category.
+DIRT_CATEGORIES = [
+    (re.compile(r"constr|land\s*disturb|grading", re.I),
+     "Construction Stormwater NOI (1+ acre)"),
+    (re.compile(r"mining|mineral|sand|gravel|aggregate|quarr|rock\s*crush", re.I),
+     "Mining/Aggregate Stormwater NOI"),
+    (re.compile(r"dredg|dewater|excavat|borrow\s*pit|fill\s*material", re.I),
+     "Dredge/Dewatering/Excavation Permit"),
+]
 
 
 def find_col(fieldnames, *candidates):
@@ -69,20 +83,23 @@ def main():
     cutoff = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
     zf = zipfile.ZipFile(ZIP_PATH)
 
-    # Pass 0: construction master permit numbers
-    masters = set()
+    # Pass 0: dirt-related master permit numbers -> category label
+    masters = {}
     try:
         r = reader(zf, member(zf, "ICIS_MASTER_GENERAL_PERMITS"))
         c_num = find_col(r.fieldnames, "EXTERNAL_PERMIT_NMBR", "PERMIT_NMBR")
         c_name = find_col(r.fieldnames, "PERMIT_NAME", "MASTER_PERMIT_NAME")
         for row in r:
-            if c_name and re.search(r"constr", row.get(c_name, "") or "", re.I):
-                masters.add((row.get(c_num) or "").strip())
-        print("construction masters:", len(masters))
+            name = row.get(c_name, "") or "" if c_name else ""
+            for pat, label in DIRT_CATEGORIES:
+                if pat.search(name):
+                    masters[(row.get(c_num) or "").strip()] = label
+                    break
+        print("dirt-related masters:", len(masters))
     except FileNotFoundError:
         print("master file not found; falling back to permit-number pattern only")
 
-    # Pass 1: permits — GPC + construction master + effective recently
+    # Pass 1: permits — GPC + dirt-related master + effective recently
     hits = {}
     r = reader(zf, member(zf, "ICIS_PERMITS"))
     f = r.fieldnames
@@ -100,10 +117,10 @@ def main():
             continue
         master = (row.get(c_master) or "").strip()
         num = (row.get(c_num) or "").strip()
-        if masters:
-            if master not in masters and not CGP_ID_RE.match(num):
-                continue
-        elif not CGP_ID_RE.match(num):
+        category = masters.get(master)
+        if not category and CGP_ID_RE.match(num):
+            category = "Construction Stormwater NOI (1+ acre)"
+        if not category:
             continue
         eff_raw = (row.get(c_eff) or "").strip()
         eff = None
@@ -126,8 +143,9 @@ def main():
             "operator": operator,
             "effective": eff.strftime("%Y-%m-%d"),
             "state": st,
+            "category": category,
         }
-    print("permit rows scanned:", n, "| fresh construction GPCs:", len(hits))
+    print("permit rows scanned:", n, "| fresh dirt-related GPCs:", len(hits))
 
     # Pass 2: facilities — join address
     r = reader(zf, member(zf, "ICIS_FACILITIES"))
@@ -164,7 +182,7 @@ def main():
                 "EPA ECHO (" + st + ")",
                 "ECHO_" + h["permit_number"],
                 h["permit_number"],
-                "Construction Stormwater NOI (1+ acre)",
+                h.get("category", "Construction Stormwater NOI (1+ acre)"),
                 h["effective"],
                 h["operator"],
                 "", "", "",
